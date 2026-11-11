@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map Navigator</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1c2430; --mute:#6b7685; --line:#d9dee5; --accent:#1a73e8; --route:#e8453c; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:14px 20px; background:var(--card); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:18px; margin:0; }
+  #status { margin-left:auto; font-size:13px; color:var(--mute); }
+  #status.ok::before { content:"●"; color:#2e9e5b; margin-right:6px; }
+  #status.bad::before { content:"●"; color:var(--route); margin-right:6px; }
+  main { display:grid; grid-template-columns:320px 1fr; gap:16px; padding:16px; max-width:1200px; margin:0 auto; }
+  @media (max-width:800px){ main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  label { display:block; font-size:13px; color:var(--mute); margin:10px 0 4px; }
+  select, button { width:100%; padding:9px 10px; font:inherit; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  button { background:var(--accent); color:#fff; border:0; cursor:pointer; margin-top:14px; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:#fff; color:var(--ink); border:1px solid var(--line); margin-top:8px; }
+  .row { display:flex; gap:8px; }
+  #summary { margin-top:14px; }
+  .stat { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px dashed var(--line); }
+  .stat b { font-variant-numeric:tabular-nums; }
+  ol { padding-left:20px; margin:8px 0 0; }
+  #err { color:var(--route); margin-top:10px; font-size:13px; }
+  canvas { width:100%; height:auto; display:block; border-radius:8px; background:#eef2f6; cursor:pointer; }
+  .hint { font-size:12px; color:var(--mute); margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Map Navigator</h1>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <section class="card">
+    <label for="from">From</label>
+    <select id="from"></select>
+    <label for="to">To</label>
+    <select id="to"></select>
+    <div class="row">
+      <div style="flex:1"><label for="algo">Algorithm</label>
+        <select id="algo"><option value="astar">A*</option><option value="dijkstra">Dijkstra</option></select></div>
+      <div style="flex:1"><label for="mode">Optimize</label>
+        <select id="mode"><option value="distance">Shortest distance</option><option value="time">Fastest time</option></select></div>
+    </div>
+    <button id="go">Find route</button>
+    <button id="swap" class="ghost">Swap</button>
+    <div id="err"></div>
+    <div id="summary"></div>
+  </section>
+  <section class="card">
+    <canvas id="map" width="900" height="640"></canvas>
+    <div class="hint">Tip: click two places on the map to set start and destination.</div>
+  </section>
+</main>
+
+<script>
+// API base: same origin by default; override with ?api=https://your-api-host
+const API = (new URLSearchParams(location.search).get("api") || "").replace(/\/$/, "");
+const $ = id => document.getElementById(id);
+const canvas = $("map"), ctx = canvas.getContext("2d");
+let graph = null, route = null, pick = 0, proj = null;
+
+async function api(path) {
+  const res = await fetch(API + path);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function buildProjection() {
+  const pad = 50, lats = graph.nodes.map(n => n.lat), lons = graph.nodes.map(n => n.lon);
+  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+  const W = canvas.width - 2 * pad, H = canvas.height - 2 * pad;
+  proj = n => ({
+    x: pad + (n.lon - minLon) / (maxLon - minLon) * W,
+    y: pad + (maxLat - n.lat) / (maxLat - minLat) * H
+  });
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const byId = Object.fromEntries(graph.nodes.map(n => [n.id, n]));
+  // roads
+  ctx.lineWidth = 2; ctx.strokeStyle = "#b8c2cf";
+  for (const e of graph.edges) {
+    const a = proj(byId[e.a]), b = proj(byId[e.b]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  // route
+  if (route) {
+    ctx.lineWidth = 6; ctx.strokeStyle = "#e8453c"; ctx.lineJoin = "round";
+    ctx.beginPath();
+    route.path.forEach((p, i) => { const q = proj(p); i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); });
+    ctx.stroke();
+  }
+  // places
+  const onRoute = new Set(route ? route.path.map(p => p.id) : []);
+  const from = +$("from").value, to = +$("to").value;
+  ctx.font = "13px system-ui, sans-serif";
+  for (const n of graph.nodes) {
+    const p = proj(n);
+    const color = n.id === from ? "#2e9e5b" : n.id === to ? "#e8453c" : onRoute.has(n.id) ? "#1c2430" : "#1a73e8";
+    ctx.beginPath(); ctx.arc(p.x, p.y, n.id === from || n.id === to ? 9 : 6, 0, 7);
+    ctx.fillStyle = "#fff"; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = color; ctx.stroke();
+    ctx.fillStyle = "#1c2430";
+    ctx.fillText(n.name, p.x + 11, p.y + 4);
+  }
+}
+
+function showRoute(r) {
+  $("summary").innerHTML =
+    `<div class="stat"><span>Distance</span><b>${r.distance_km} km</b></div>
+     <div class="stat"><span>Travel time</span><b>${r.duration_min} min</b></div>
+     <div class="stat"><span>Places explored</span><b>${r.nodes_explored}</b></div>
+     <div class="stat"><span>Compute time</span><b>${r.compute_ms} ms</b></div>
+     <ol>${r.path.map(p => `<li>${p.name}</li>`).join("")}</ol>`;
+}
+
+async function findRoute() {
+  $("err").textContent = "";
+  const q = new URLSearchParams({ from: $("from").value, to: $("to").value, algo: $("algo").value, mode: $("mode").value });
+  $("go").disabled = true;
+  try {
+    route = await api("/api/route?" + q);
+    showRoute(route);
+  } catch (e) {
+    route = null; $("summary").innerHTML = ""; $("err").textContent = e.message;
+  } finally { $("go").disabled = false; draw(); }
+}
+
+canvas.addEventListener("click", ev => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * canvas.width / rect.width;
+  const y = (ev.clientY - rect.top) * canvas.height / rect.height;
+  let best = null, bd = 22 * 22;
+  for (const n of graph.nodes) {
+    const p = proj(n), d = (p.x - x) ** 2 + (p.y - y) ** 2;
+    if (d < bd) { bd = d; best = n; }
+  }
+  if (!best) return;
+  $(pick === 0 ? "from" : "to").value = best.id;
+  pick ^= 1;
+  if (pick === 0) findRoute(); else { route = null; draw(); }
+});
+
+$("go").onclick = findRoute;
+$("swap").onclick = () => { const f = $("from").value; $("from").value = $("to").value; $("to").value = f; findRoute(); };
+
+(async function init() {
+  try {
+    const h = await api("/api/health");
+    $("status").textContent = `API online · ${h.nodes} places, ${h.edges} roads`;
+    $("status").className = "ok";
+    graph = await api("/api/graph");
+    const { places } = await api("/api/places");
+    for (const id of ["from", "to"])
+      $(id).innerHTML = places.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
+    $("from").value = 0; $("to").value = 8;
+    buildProjection(); draw(); findRoute();
+  } catch (e) {
+    $("status").textContent = "API unreachable";
+    $("status").className = "bad";
+    $("err").textContent = "Could not reach the backend: " + e.message;
+  }
+})();
+</script>
+</body>
+</html>
